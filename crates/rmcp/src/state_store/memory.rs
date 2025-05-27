@@ -35,6 +35,9 @@ struct MemoryStateStoreInner {
     // Service request tracking
     request_responders: RwLock<HashMap<String, HashMap<RequestId, ResponderData>>>,
     cancellation_tokens: RwLock<HashMap<String, HashMap<RequestId, CancellationTokenData>>>,
+    
+    // Instance health tracking
+    instance_health: RwLock<HashMap<String, InstanceHealthData>>,
 }
 
 #[derive(Debug)]
@@ -71,6 +74,7 @@ impl MemoryStateStore {
                 sse_connections: RwLock::new(HashMap::new()),
                 request_responders: RwLock::new(HashMap::new()),
                 cancellation_tokens: RwLock::new(HashMap::new()),
+                instance_health: RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -321,5 +325,120 @@ impl StateStore for MemoryStateStore {
             service_tokens.remove(request_id);
         }
         Ok(())
+    }
+
+    async fn find_session_instance(&self, session_id: &SessionId) -> Result<Option<String>, Self::Error> {
+        let sse_connections = self.inner.sse_connections.read().await;
+        
+        // Look up the session in SSE connections to find the server instance
+        if let Some(connection_data) = sse_connections.get(session_id) {
+            Ok(Some(connection_data.server_instance_id.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_active_sessions(&self) -> Result<Vec<(SessionId, String)>, Self::Error> {
+        let sse_connections = self.inner.sse_connections.read().await;
+        
+        let sessions = sse_connections.iter()
+            .map(|(session_id, connection_data)| (session_id.clone(), connection_data.server_instance_id.clone()))
+            .collect();
+        
+        Ok(sessions)
+    }
+
+    async fn list_sessions_by_instance(&self, server_instance_id: &str) -> Result<Vec<SessionId>, Self::Error> {
+        let sse_connections = self.inner.sse_connections.read().await;
+        
+        let sessions = sse_connections.iter()
+            .filter(|(_, connection_data)| connection_data.server_instance_id == server_instance_id)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        
+        Ok(sessions)
+    }
+
+    async fn update_session_heartbeat(&self, session_id: &SessionId) -> Result<(), Self::Error> {
+        let mut sse_connections = self.inner.sse_connections.write().await;
+        
+        if let Some(connection_data) = sse_connections.get_mut(session_id) {
+            connection_data.last_ping = std::time::SystemTime::now();
+        }
+        
+        Ok(())
+    }
+
+    async fn is_session_healthy(&self, session_id: &SessionId, max_idle_duration: std::time::Duration) -> Result<bool, Self::Error> {
+        let sse_connections = self.inner.sse_connections.read().await;
+        
+        if let Some(connection_data) = sse_connections.get(session_id) {
+            let now = std::time::SystemTime::now();
+            if let Ok(elapsed) = now.duration_since(connection_data.last_ping) {
+                Ok(elapsed < max_idle_duration)
+            } else {
+                Ok(false) // Invalid time, consider unhealthy
+            }
+        } else {
+            Ok(false) // Session not found, consider unhealthy
+        }
+    }
+
+    async fn cleanup_stale_sessions(&self, max_idle_duration: std::time::Duration) -> Result<Vec<SessionId>, Self::Error> {
+        let mut sse_connections = self.inner.sse_connections.write().await;
+        let now = std::time::SystemTime::now();
+        let mut stale_sessions = Vec::new();
+        
+        // Find stale sessions
+        let sessions_to_remove: Vec<SessionId> = sse_connections.iter()
+            .filter_map(|(session_id, connection_data)| {
+                if let Ok(elapsed) = now.duration_since(connection_data.last_ping) {
+                    if elapsed >= max_idle_duration {
+                        Some(session_id.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(session_id.clone()) // Invalid time, remove
+                }
+            })
+            .collect();
+        
+        // Remove stale sessions
+        for session_id in &sessions_to_remove {
+            sse_connections.remove(session_id);
+            stale_sessions.push(session_id.clone());
+        }
+        
+        Ok(stale_sessions)
+    }
+
+    async fn mark_instance_unhealthy(&self, server_instance_id: &str) -> Result<(), Self::Error> {
+        let mut instance_health = self.inner.instance_health.write().await;
+        
+        let health_data = instance_health.entry(server_instance_id.to_string())
+            .or_insert_with(|| InstanceHealthData {
+                server_instance_id: server_instance_id.to_string(),
+                last_heartbeat: std::time::SystemTime::now(),
+                is_healthy: true,
+                failed_health_checks: 0,
+            });
+        
+        health_data.is_healthy = false;
+        health_data.failed_health_checks += 1;
+        health_data.last_heartbeat = std::time::SystemTime::now();
+        
+        Ok(())
+    }
+
+    async fn get_healthy_instances(&self) -> Result<Vec<String>, Self::Error> {
+        let instance_health = self.inner.instance_health.read().await;
+        
+        let healthy_instances = instance_health.values()
+            .filter(|health| health.is_healthy)
+            .map(|health| health.server_instance_id.clone())
+            .collect();
+        
+        Ok(healthy_instances)
     }
 }

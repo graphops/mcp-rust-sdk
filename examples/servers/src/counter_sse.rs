@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
         post_path: "/message".to_string(),
         ct: tokio_util::sync::CancellationToken::new(),
         sse_keep_alive: None,
+        state_store: None,
     };
 
     let (sse_server, router) = SseServer::new(config);

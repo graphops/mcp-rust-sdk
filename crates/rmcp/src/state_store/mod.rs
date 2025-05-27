@@ -97,6 +97,18 @@ pub trait StateStore: Send + Sync + Clone {
     async fn store_cancellation_token(&self, service_id: &str, request_id: &RequestId, token_data: &CancellationTokenData) -> Result<(), Self::Error>;
     async fn get_cancellation_token(&self, service_id: &str, request_id: &RequestId) -> Result<Option<CancellationTokenData>, Self::Error>;
     async fn remove_cancellation_token(&self, service_id: &str, request_id: &RequestId) -> Result<(), Self::Error>;
+
+    // Session discovery and routing for cross-instance communication
+    async fn find_session_instance(&self, session_id: &SessionId) -> Result<Option<String>, Self::Error>;
+    async fn list_active_sessions(&self) -> Result<Vec<(SessionId, String)>, Self::Error>;
+    async fn list_sessions_by_instance(&self, server_instance_id: &str) -> Result<Vec<SessionId>, Self::Error>;
+
+    // Connection health monitoring and failover
+    async fn update_session_heartbeat(&self, session_id: &SessionId) -> Result<(), Self::Error>;
+    async fn is_session_healthy(&self, session_id: &SessionId, max_idle_duration: std::time::Duration) -> Result<bool, Self::Error>;
+    async fn cleanup_stale_sessions(&self, max_idle_duration: std::time::Duration) -> Result<Vec<SessionId>, Self::Error>;
+    async fn mark_instance_unhealthy(&self, server_instance_id: &str) -> Result<(), Self::Error>;
+    async fn get_healthy_instances(&self) -> Result<Vec<String>, Self::Error>;
 }
 
 /// HTTP request routing data
@@ -121,6 +133,7 @@ pub struct SseConnectionData {
     pub created_at: SystemTime,
     pub last_ping: SystemTime,
     pub ping_interval: std::time::Duration,
+    pub server_instance_id: String,
 }
 
 /// Service request responder metadata
@@ -137,6 +150,15 @@ pub struct CancellationTokenData {
     pub created_at: SystemTime,
     pub is_cancelled: bool,
     pub cancel_reason: Option<String>,
+}
+
+/// Server instance health data
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstanceHealthData {
+    pub server_instance_id: String,
+    pub last_heartbeat: SystemTime,
+    pub is_healthy: bool,
+    pub failed_health_checks: u32,
 }
 
 // Re-export implementations

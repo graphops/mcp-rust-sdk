@@ -175,7 +175,7 @@ where
             context: "send initialized notification".into(),
         })?;
     let (peer, peer_rx) = Peer::new(id_provider, Some(initialize_result));
-    Ok(serve_inner(service, transport, peer, peer_rx, ct).await)
+    Ok(serve_inner(service, transport, peer, peer_rx, ct, None).await)
 }
 
 macro_rules! method {

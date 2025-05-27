@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
         post_path: "/message".to_string(),
         ct: CancellationToken::new(),
         sse_keep_alive: Some(Duration::from_secs(15)),
+        state_store: None,
     };
 
     // Create SSE server

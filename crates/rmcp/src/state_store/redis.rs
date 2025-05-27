@@ -424,6 +424,186 @@ impl StateStore for RedisStateStore {
         let _: () = conn.hdel(&key, request_key).await?;
         Ok(())
     }
+
+    async fn find_session_instance(&self, session_id: &SessionId) -> Result<Option<String>, Self::Error> {
+        let mut conn = self.connection.clone();
+        let key = self.sse_connections_key();
+        let session_key = self.serialize(session_id).await?;
+        
+        match conn.hget::<_, _, Vec<u8>>(&key, session_key).await {
+            Ok(data) => {
+                let connection_data: SseConnectionData = self.deserialize(data).await?;
+                Ok(Some(connection_data.server_instance_id))
+            },
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn list_active_sessions(&self) -> Result<Vec<(SessionId, String)>, Self::Error> {
+        let mut conn = self.connection.clone();
+        let key = self.sse_connections_key();
+        
+        let hash: std::collections::HashMap<Vec<u8>, Vec<u8>> = conn.hgetall(&key).await?;
+        let mut sessions = Vec::new();
+        
+        for (session_data, connection_data) in hash {
+            if let (Ok(session_id), Ok(connection)) = (
+                self.deserialize::<SessionId>(session_data).await,
+                self.deserialize::<SseConnectionData>(connection_data).await,
+            ) {
+                sessions.push((session_id, connection.server_instance_id));
+            }
+        }
+        
+        Ok(sessions)
+    }
+
+    async fn list_sessions_by_instance(&self, server_instance_id: &str) -> Result<Vec<SessionId>, Self::Error> {
+        let mut conn = self.connection.clone();
+        let key = self.sse_connections_key();
+        
+        let hash: std::collections::HashMap<Vec<u8>, Vec<u8>> = conn.hgetall(&key).await?;
+        let mut sessions = Vec::new();
+        
+        for (session_data, connection_data) in hash {
+            if let (Ok(session_id), Ok(connection)) = (
+                self.deserialize::<SessionId>(session_data).await,
+                self.deserialize::<SseConnectionData>(connection_data).await,
+            ) {
+                if connection.server_instance_id == server_instance_id {
+                    sessions.push(session_id);
+                }
+            }
+        }
+        
+        Ok(sessions)
+    }
+
+    async fn update_session_heartbeat(&self, session_id: &SessionId) -> Result<(), Self::Error> {
+        let mut conn = self.connection.clone();
+        let key = self.sse_connections_key();
+        let session_key = self.serialize(session_id).await?;
+        
+        // Get current connection data
+        match conn.hget::<_, _, Vec<u8>>(&key, &session_key).await {
+            Ok(data) => {
+                let mut connection_data: SseConnectionData = self.deserialize(data).await?;
+                connection_data.last_ping = std::time::SystemTime::now();
+                
+                // Update with new heartbeat
+                let updated_data = self.serialize(&connection_data).await?;
+                let ttl = self.config.session_ttl.as_secs() as usize;
+                
+                let _: () = conn.hset(&key, session_key, updated_data).await?;
+                let _: () = conn.expire(&key, ttl as i64).await?;
+            },
+            Err(_) => {
+                // Session not found, ignore
+            }
+        }
+        
+        Ok(())
+    }
+
+    async fn is_session_healthy(&self, session_id: &SessionId, max_idle_duration: std::time::Duration) -> Result<bool, Self::Error> {
+        let mut conn = self.connection.clone();
+        let key = self.sse_connections_key();
+        let session_key = self.serialize(session_id).await?;
+        
+        match conn.hget::<_, _, Vec<u8>>(&key, session_key).await {
+            Ok(data) => {
+                let connection_data: SseConnectionData = self.deserialize(data).await?;
+                let now = std::time::SystemTime::now();
+                
+                if let Ok(elapsed) = now.duration_since(connection_data.last_ping) {
+                    Ok(elapsed < max_idle_duration)
+                } else {
+                    Ok(false) // Invalid time, consider unhealthy
+                }
+            },
+            Err(_) => Ok(false), // Session not found, consider unhealthy
+        }
+    }
+
+    async fn cleanup_stale_sessions(&self, max_idle_duration: std::time::Duration) -> Result<Vec<SessionId>, Self::Error> {
+        let mut conn = self.connection.clone();
+        let key = self.sse_connections_key();
+        let now = std::time::SystemTime::now();
+        
+        let hash: std::collections::HashMap<Vec<u8>, Vec<u8>> = conn.hgetall(&key).await?;
+        let mut stale_sessions = Vec::new();
+        
+        for (session_data, connection_data) in hash {
+            if let (Ok(session_id), Ok(connection)) = (
+                self.deserialize::<SessionId>(session_data).await,
+                self.deserialize::<SseConnectionData>(connection_data).await,
+            ) {
+                let is_stale = if let Ok(elapsed) = now.duration_since(connection.last_ping) {
+                    elapsed >= max_idle_duration
+                } else {
+                    true // Invalid time, consider stale
+                };
+                
+                if is_stale {
+                    // Remove the session
+                    let session_key = self.serialize(&session_id).await?;
+                    let _: () = conn.hdel(&key, session_key).await?;
+                    stale_sessions.push(session_id);
+                }
+            }
+        }
+        
+        Ok(stale_sessions)
+    }
+
+    async fn mark_instance_unhealthy(&self, server_instance_id: &str) -> Result<(), Self::Error> {
+        let mut conn = self.connection.clone();
+        let key = format!("{}:instance_health", self.config.key_prefix);
+        let ttl = self.config.session_ttl.as_secs() as usize;
+        
+        // Get or create health data
+        let health_data = match conn.hget::<_, _, Vec<u8>>(&key, server_instance_id).await {
+            Ok(data) => {
+                let mut health: InstanceHealthData = self.deserialize(data).await?;
+                health.is_healthy = false;
+                health.failed_health_checks += 1;
+                health.last_heartbeat = std::time::SystemTime::now();
+                health
+            },
+            Err(_) => {
+                InstanceHealthData {
+                    server_instance_id: server_instance_id.to_string(),
+                    last_heartbeat: std::time::SystemTime::now(),
+                    is_healthy: false,
+                    failed_health_checks: 1,
+                }
+            }
+        };
+        
+        let data = self.serialize(&health_data).await?;
+        let _: () = conn.hset(&key, server_instance_id, data).await?;
+        let _: () = conn.expire(&key, ttl as i64).await?;
+        
+        Ok(())
+    }
+
+    async fn get_healthy_instances(&self) -> Result<Vec<String>, Self::Error> {
+        let mut conn = self.connection.clone();
+        let key = format!("{}:instance_health", self.config.key_prefix);
+        
+        let hash: std::collections::HashMap<String, Vec<u8>> = conn.hgetall(&key).await?;
+        let mut healthy_instances = Vec::new();
+        
+        for (_instance_id, health_data) in hash {
+            if let Ok(health) = self.deserialize::<InstanceHealthData>(health_data).await {
+                if health.is_healthy {
+                    healthy_instances.push(health.server_instance_id);
+                }
+            }
+        }
+        
+        Ok(healthy_instances)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

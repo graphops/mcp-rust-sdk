@@ -212,7 +212,7 @@ where
     };
     let _ = service.handle_notification(notification).await;
     // Continue processing service
-    Ok(serve_inner(service, transport, peer, peer_rx, ct).await)
+    Ok(serve_inner(service, transport, peer, peer_rx, ct, None).await)
 }
 
 macro_rules! method {

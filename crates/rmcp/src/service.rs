@@ -9,6 +9,7 @@ use crate::{
         JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Meta, NumberOrString, ProgressToken,
         RequestId, ServerJsonRpcMessage,
     },
+    state_store::StateStore,
     transport::{IntoTransport, Transport},
 };
 #[cfg(feature = "client")]
@@ -516,7 +517,77 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     let (peer, peer_rx) = Peer::new(Arc::new(AtomicU32RequestIdProvider::default()), peer_info);
-    serve_inner(service, transport, peer, peer_rx, ct).await
+    serve_inner(service, transport, peer, peer_rx, ct, None).await
+}
+
+/// Serve with state store support for horizontal scaling
+pub async fn serve_directly_with_state_store<R, S, T, E, A>(
+    service: S,
+    transport: T,
+    peer_info: Option<R::PeerInfo>,
+    ct: CancellationToken,
+    state_store: crate::state_store::MemoryStateStore,
+    service_id: String,
+) -> RunningService<R, S>
+where
+    R: ServiceRole,
+    S: Service<R>,
+    T: IntoTransport<R, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let (peer, peer_rx) = Peer::new(Arc::new(AtomicU32RequestIdProvider::default()), peer_info);
+    serve_inner(service, transport, peer, peer_rx, ct, Some((state_store, service_id))).await
+}
+
+/// Helper for managing service request state via state store
+struct ServiceStateManager {
+    state_store: crate::state_store::MemoryStateStore,
+    service_id: String,
+}
+
+impl ServiceStateManager {
+    fn new(state_store: crate::state_store::MemoryStateStore, service_id: String) -> Self {
+        Self { state_store, service_id }
+    }
+
+    async fn store_responder_data(&self, request_id: &RequestId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let responder_data = crate::state_store::ResponderData {
+            created_at: std::time::SystemTime::now(),
+            timeout: Some(std::time::Duration::from_secs(30)), // Default timeout
+        };
+        self.state_store.store_request_responder(&self.service_id, request_id, &responder_data).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    async fn remove_responder_data(&self, request_id: &RequestId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.state_store.remove_request_responder(&self.service_id, request_id).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    async fn store_cancellation_token(&self, request_id: &RequestId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let token_data = crate::state_store::CancellationTokenData {
+            created_at: std::time::SystemTime::now(),
+            is_cancelled: false,
+            cancel_reason: None,
+        };
+        self.state_store.store_cancellation_token(&self.service_id, request_id, &token_data).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    async fn cancel_token(&self, request_id: &RequestId, reason: Option<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let token_data = crate::state_store::CancellationTokenData {
+            created_at: std::time::SystemTime::now(),
+            is_cancelled: true,
+            cancel_reason: reason,
+        };
+        self.state_store.store_cancellation_token(&self.service_id, request_id, &token_data).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    async fn remove_cancellation_token(&self, request_id: &RequestId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.state_store.remove_cancellation_token(&self.service_id, request_id).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
 }
 
 #[instrument(skip_all)]
@@ -526,6 +597,7 @@ async fn serve_inner<R, S, T, E, A>(
     peer: Peer<R>,
     mut peer_rx: tokio::sync::mpsc::Receiver<PeerSinkMessage<R>>,
     ct: CancellationToken,
+    state_store_config: Option<(crate::state_store::MemoryStateStore, String)>,
 ) -> RunningService<R, S>
 where
     R: ServiceRole,
@@ -546,6 +618,12 @@ where
     let mut local_responder_pool =
         HashMap::<RequestId, Responder<Result<R::PeerResp, ServiceError>>>::new();
     let mut local_ct_pool = HashMap::<RequestId, CancellationToken>::new();
+    
+    // Initialize state store manager if provided
+    let state_manager = state_store_config.map(|(state_store, service_id)| {
+        ServiceStateManager::new(state_store, service_id)
+    });
+    
     let shared_service = Arc::new(service);
     // for return
     let service = shared_service.clone();

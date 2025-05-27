@@ -74,6 +74,7 @@ impl App {
                 created_at: std::time::SystemTime::now(),
                 last_ping: std::time::SystemTime::now(),
                 ping_interval: self.sse_ping_interval,
+                server_instance_id: self.server_instance_id.clone(),
             };
             state_store.register_sse_connection(session_id, &connection_data).await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
