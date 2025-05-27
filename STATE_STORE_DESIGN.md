@@ -379,14 +379,22 @@ tokio = { version = "1.0", features = ["time"] }
 
 ## Implementation Status
 
-### ✅ Completed
+### ✅ Phase 1: Core Abstraction Layer - COMPLETE
 - **State Store Abstraction**: Core trait and type definitions implemented in `crates/rmcp/src/state_store/mod.rs`
 - **Memory Backend**: Fully functional in-memory implementation for backward compatibility in `crates/rmcp/src/state_store/memory.rs`
 - **Redis Backend**: Complete Redis implementation with connection pooling and cluster support in `crates/rmcp/src/state_store/redis.rs`
 - **Configuration System**: Builder pattern configuration system in `crates/rmcp/src/state_store/config.rs`
 - **Session Types**: Serializable types for session state in `crates/rmcp/src/transport/streamable_http_server/session.rs`
-- **Feature Flags**: Cargo feature flags for optional Redis dependency (`state-store`, `state-store-redis`)
+- **Always-Available Architecture**: State store abstraction is core library feature, not feature-gated
+- **Transport Integration**: Conditional type imports with fallbacks for different transport feature combinations
 - **Test Suite**: Comprehensive tests in `crates/rmcp/tests/test_state_store.rs` - **All 5 tests passing**
+
+### ✅ Phase 2: Basic Integration - COMPLETE  
+- **Feature Flag Simplification**: Removed `state-store` feature gate, only `state-store-redis` remains optional
+- **Dependency Management**: `async-trait` now core dependency, Redis optional
+- **SSE Server Integration**: Added state store configuration to `SseServerConfig` with `.with_state_store()` method
+- **Type Compatibility**: Session types made public and serializable for state persistence
+- **Compilation Verified**: All transport combinations compile correctly
 
 ### 📋 Implementation Details
 
@@ -471,18 +479,173 @@ test tests::test_memory_state_store_concurrent_access ... ok
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-### 🚀 Ready for Integration
-The state store system is fully implemented and tested. Next steps for horizontal scaling:
+### 🚧 Phase 3: Deep Integration for Horizontal Scaling - REMAINING
 
-1. **Integration with SSE Server**: Replace `TxStore` in `sse_server.rs` with state store trait
-2. **Session Worker Updates**: Integrate state store into `session.rs` worker lifecycle  
-3. **Configuration**: Add state store config to server builders
-4. **Load Balancer Testing**: Test session persistence across multiple server instances
+To achieve full horizontal scaling without sticky sessions, the following work remains:
 
-### Performance Characteristics
-- **Memory Backend**: Zero-latency for development and single-instance deployments
-- **Redis Backend**: <10ms latency with connection pooling and efficient serialization (bincode)
-- **Scalability**: Designed for horizontal scaling with proper Redis cluster configuration
+#### 3.1 SSE Server State Externalization
+**Current State**: SSE server uses in-memory `TxStore` (HashMap<SessionId, Sender>)
+**Required Work**:
+- Replace `TxStore` with state store calls for session registration
+- Store SSE connection metadata in state store instead of local HashMap  
+- Implement session discovery across multiple server instances
+- Add connection health checks and cleanup for dead sessions
+
+**Key Files**: `crates/rmcp/src/transport/sse_server.rs:25-26, 97-100, 139-141`
+
+#### 3.2 Session Worker State Migration  
+**Current State**: Session worker manages state in local HashMaps
+**Required Work**:
+- Replace `tx_router: HashMap<HttpRequestId, HttpRequestWise>` with state store calls (`session.rs:163`)
+- Replace `resource_router: HashMap<ResourceKey, HttpRequestId>` with state store calls (`session.rs:164`)  
+- Migrate `cache: VecDeque<ServerSessionMessage>` to state store message caching (`session.rs:87`)
+- Update session lifecycle methods to persist state changes
+- Implement session state recovery on worker restart/migration
+
+**Key Files**: `crates/rmcp/src/transport/streamable_http_server/session.rs:160-168`
+
+#### 3.3 Service Request Correlation
+**Current State**: Service layer uses local pools for request tracking
+**Required Work**:
+- Replace `local_responder_pool: HashMap<RequestId, Responder>` with state store (`service.rs:547`)
+- Replace `local_ct_pool: HashMap<RequestId, CancellationToken>` with state store (`service.rs:548`)
+- Implement cross-instance request/response routing
+- Add request orphan detection and cleanup
+
+**Key Files**: `crates/rmcp/src/service.rs:547-548`
+
+#### 3.4 Session Discovery and Routing
+**New Requirements**:
+- Implement session location registry (which server instance owns which session)
+- Add session migration support for graceful server shutdowns
+- Create session proxy/forwarding for requests routed to wrong instances
+- Implement distributed session cleanup coordination
+
+#### 3.5 Connection Failover and Recovery
+**New Requirements**:
+- SSE connection re-establishment after server instance failure
+- Message replay from state store for reconnected clients
+- Duplicate message detection across instances
+- Connection timeout and cleanup coordination
+
+#### 3.6 Load Balancer Integration
+**Testing Requirements**:
+- Validate session persistence with sticky session disabled
+- Test connection failover scenarios
+- Benchmark performance under load with state store latency
+- Verify message ordering and delivery guarantees
+
+### Current Architecture Limitations for Horizontal Scaling
+
+#### 1. Channel-Based Communication
+- **Issue**: Tokio channels (Sender/Receiver) cannot be serialized or shared across processes
+- **Impact**: Direct message channels break when routing between server instances
+- **Solution Required**: Replace direct channels with state store message queuing + polling
+
+#### 2. In-Memory Session State
+- **Issue**: Session routing tables, resource mappings, and message caches are instance-local
+- **Impact**: Session continuity breaks when load balancer routes to different instance
+- **Solution Required**: Externalize all session state to shared store
+
+#### 3. Request/Response Correlation  
+- **Issue**: Service request responders and cancellation tokens are instance-local
+- **Impact**: Response delivery fails if handled by different instance than originator
+- **Solution Required**: Cross-instance request routing with state store coordination
+
+### 🎯 Complete Integration Roadmap
+
+#### Phase 3A: SSE Server Externalization (Critical Path)
+```rust
+// Current (instance-local)
+app.txs.write().await.insert(session.clone(), from_client_tx);
+
+// Target (state store)
+state_store.register_sse_connection(&session, &SseConnectionData {
+    server_instance: instance_id(),
+    created_at: SystemTime::now(),
+    last_ping: SystemTime::now(),
+}).await?;
+```
+
+#### Phase 3B: Session Worker Migration  
+```rust
+// Current (instance-local)
+self.tx_router.insert(http_request_id, HttpRequestWise { .. });
+
+// Target (state store)
+self.state_store.store_tx_route(&self.id, http_request_id, &RouteData {
+    resources: route.resources,
+    capacity: route.capacity,
+    created_at: SystemTime::now(),
+}).await?;
+```
+
+#### Phase 3C: Cross-Instance Request Routing
+```rust
+// Target: Request proxy for cross-instance routing
+if let Some(responder) = state_store.get_request_responder(service_id, request_id).await? {
+    if responder.server_instance != current_instance() {
+        // Forward request to owning instance
+        forward_request_to_instance(responder.server_instance, request).await?;
+    }
+}
+```
+
+### Performance Characteristics (Current vs Target)
+- **Memory Backend**: Zero-latency → Zero-latency (no change)
+- **Redis Backend**: N/A → <10ms latency per state operation  
+- **Horizontal Scaling**: ❌ Not supported → ✅ Full support without sticky sessions
+- **Session Affinity**: ❌ Required → ✅ Not required
+
+## Summary: Current State vs Horizontal Scaling Requirements
+
+### ✅ **COMPLETE: Foundation for Horizontal Scaling**
+The state store abstraction provides the architectural foundation needed for horizontal scaling:
+
+1. **✅ State Store Trait**: Complete async interface for all session state operations
+2. **✅ Memory Backend**: Backward-compatible default implementation 
+3. **✅ Redis Backend**: Production-ready external state storage with clustering
+4. **✅ Configuration**: Builder pattern for state store setup
+5. **✅ Type System**: All session types are serializable and state store compatible
+6. **✅ Integration Points**: State store configuration added to server builders
+
+**Result**: Developers can now externalize session state using the state store API.
+
+### 🚧 **REMAINING: Deep Integration for True Horizontal Scaling**
+
+To eliminate sticky session requirements and achieve true horizontal scaling, these critical areas need state store integration:
+
+#### **Critical Path 1: SSE Connection Management**
+- **Current**: In-memory HashMap stores session → sender mappings locally
+- **Required**: Externalize SSE connection registry to state store
+- **Impact**: Essential for load balancer session routing
+
+#### **Critical Path 2: Session Worker State**  
+- **Current**: Session routing tables and message caches are instance-local
+- **Required**: Replace HashMaps with state store calls for tx_router, resource_router, cache
+- **Impact**: Required for session continuity across instances
+
+#### **Critical Path 3: Service Request Tracking**
+- **Current**: Request responders and cancellation tokens stored locally  
+- **Required**: Cross-instance request/response correlation via state store
+- **Impact**: Needed for request handling across multiple instances
+
+### 🎯 **Horizontal Scaling Readiness**
+
+| Component | Current Status | Horizontal Scaling Ready |
+|-----------|----------------|-------------------------|
+| State Store Abstraction | ✅ Complete | ✅ Yes |  
+| Memory Backend | ✅ Complete | ✅ Yes (single instance) |
+| Redis Backend | ✅ Complete | ✅ Yes (multi-instance) |
+| SSE Server | 🔶 Config only | ❌ No - needs state externalization |
+| Session Worker | 🔶 Types ready | ❌ No - needs HashMap replacement |
+| Service Layer | 🔶 Types ready | ❌ No - needs request tracking |
+| Load Balancer Support | ❌ Not implemented | ❌ No - requires above work |
+
+**Current State**: State store foundation complete, but sticky sessions still required  
+**Target State**: Full horizontal scaling without sticky sessions
+
+The remaining work primarily involves replacing in-memory data structures with state store calls in the core session management components.
 
 ## Future Enhancements
 

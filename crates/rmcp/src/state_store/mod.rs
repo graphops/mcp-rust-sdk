@@ -7,20 +7,42 @@ use std::{collections::HashSet, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "state-store")]
 use async_trait::async_trait;
 
-use crate::{
-    model::RequestId,
-    transport::{
-        common::axum::SessionId,
-        streamable_http_server::session::{ResourceKey, ServerSessionMessage},
-    },
-};
+use crate::model::RequestId;
 
-#[cfg(feature = "state-store")]
+#[cfg(any(feature = "transport-streamable-http-server", feature = "transport-sse-server"))]
+use crate::transport::common::axum::SessionId;
+
+#[cfg(feature = "transport-streamable-http-server-session")]
+use crate::transport::streamable_http_server::session::{ResourceKey, ServerSessionMessage};
+
+// Fallback types when transport features are not enabled
+#[cfg(not(any(feature = "transport-streamable-http-server", feature = "transport-sse-server")))]
+pub type SessionId = String;
+
+#[cfg(not(feature = "transport-streamable-http-server-session"))]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ResourceKey {
+    McpRequestId(RequestId),
+    ProgressToken(String),
+}
+
+#[cfg(not(feature = "transport-streamable-http-server-session"))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ServerSessionMessage {
+    pub event_id: EventId,
+    pub message: std::sync::Arc<serde_json::Value>,
+}
+
+#[cfg(not(feature = "transport-streamable-http-server-session"))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct EventId {
+    pub http_request_id: Option<HttpRequestId>,
+    pub index: usize,
+}
+
 pub mod config;
-#[cfg(feature = "state-store")]
 pub mod memory;
 #[cfg(feature = "state-store-redis")]
 pub mod redis;
@@ -29,7 +51,6 @@ pub mod redis;
 pub type HttpRequestId = u64;
 
 /// State store abstraction for session persistence
-#[cfg(feature = "state-store")]
 #[async_trait]
 pub trait StateStore: Send + Sync + Clone {
     type Error: std::error::Error + Send + Sync + 'static;
@@ -119,9 +140,7 @@ pub struct CancellationTokenData {
 }
 
 // Re-export implementations
-#[cfg(feature = "state-store")]
 pub use config::{StateStoreConfig, StateStoreConfigBuilder};
-#[cfg(feature = "state-store")]
 pub use memory::MemoryStateStore;
 #[cfg(feature = "state-store-redis")]
 pub use redis::{RedisConfig, RedisStateStore};

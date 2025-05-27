@@ -742,6 +742,11 @@ pub struct SessionConfig {
 
 impl SessionConfig {
     pub const DEFAULT_CHANNEL_CAPACITY: usize = 16;
+    
+    pub fn with_channel_capacity(mut self, capacity: usize) -> Self {
+        self.channel_capacity = capacity;
+        self
+    }
 }
 
 impl Default for SessionConfig {

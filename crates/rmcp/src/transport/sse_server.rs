@@ -20,10 +20,10 @@ use crate::{
     model::ClientJsonRpcMessage,
     service::{RxJsonRpcMessage, TxJsonRpcMessage, serve_directly_with_ct},
     transport::common::axum::{DEFAULT_AUTO_PING_INTERVAL, SessionId, session_id},
+    state_store::MemoryStateStore,
 };
 
-type TxStore =
-    Arc<tokio::sync::RwLock<HashMap<SessionId, tokio::sync::mpsc::Sender<ClientJsonRpcMessage>>>>;
+type TxStore = Arc<tokio::sync::RwLock<HashMap<SessionId, tokio::sync::mpsc::Sender<ClientJsonRpcMessage>>>>;
 pub type TransportReceiver = ReceiverStream<RxJsonRpcMessage<RoleServer>>;
 
 #[derive(Clone)]
@@ -219,6 +219,14 @@ pub struct SseServerConfig {
     pub post_path: String,
     pub ct: CancellationToken,
     pub sse_keep_alive: Option<Duration>,
+    pub state_store: Option<MemoryStateStore>,
+}
+
+impl SseServerConfig {
+    pub fn with_state_store(mut self, state_store: MemoryStateStore) -> Self {
+        self.state_store = Some(state_store);
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -235,6 +243,7 @@ impl SseServer {
             post_path: "/message".to_string(),
             ct: CancellationToken::new(),
             sse_keep_alive: None,
+            state_store: None,
         })
         .await
     }

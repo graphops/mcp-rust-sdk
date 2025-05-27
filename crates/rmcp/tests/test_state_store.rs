@@ -1,6 +1,5 @@
 //! Comprehensive tests for state store implementations.
 
-#[cfg(feature = "state-store")]
 mod tests {
     use std::{collections::HashSet, time::SystemTime};
 
