@@ -591,9 +591,11 @@ let healthy_instances = state_store.get_healthy_instances().await?;
 
 ## Testing & Validation
 
-### Test Coverage
+### Current Test Coverage
 
-The implementation includes comprehensive test coverage with **10 test cases** covering all major functionality:
+The implementation includes comprehensive **unit and integration test coverage** with **10 core state store tests** and **7 load balancer simulation tests** covering major functionality:
+
+#### Core State Store Tests (10 tests):
 
 1. **`test_memory_state_store_session_lifecycle`**: Core session creation, existence checking, and deletion
 2. **`test_memory_state_store_session_handles`**: Session handle registration and management
@@ -606,10 +608,26 @@ The implementation includes comprehensive test coverage with **10 test cases** c
 9. **`test_session_discovery_and_routing`**: Cross-instance session discovery functionality
 10. **`test_connection_health_monitoring`**: Health monitoring and failover capabilities
 
+#### Load Balancer Simulation Tests (7 tests):
+
+1. **`test_load_balancer_basic_distribution`**: Round-robin session distribution across instances
+2. **`test_cross_instance_request_routing`**: Session discovery and request forwarding simulation
+3. **`test_instance_failure_and_recovery`**: Instance failure detection and traffic rerouting
+4. **`test_session_discovery_across_instances`**: Multi-instance session location capabilities
+5. **`test_concurrent_multi_instance_operations`**: High-concurrency multi-instance scenarios
+6. **`test_session_cleanup_across_instances`**: Cross-instance session cleanup coordination
+7. **`test_zero_downtime_scaling`**: Adding new instances without service interruption
+
 ### Test Execution
 ```bash
 # Run all state store tests
 cargo test --test test_state_store
+
+# Run load balancer simulation tests
+cargo test --test test_load_balancer_simulation
+
+# Run Redis integration tests (requires Redis server)
+cargo test --test test_redis_integration --features test-redis
 
 # Run specific test
 cargo test test_session_discovery_and_routing
@@ -618,18 +636,72 @@ cargo test test_session_discovery_and_routing
 cargo test --test test_state_store -- --nocapture
 ```
 
-### Integration Testing
+### What Our Tests Validate
 
-The test suite validates:
-- ✅ Session lifecycle management across backends
-- ✅ Cross-instance session discovery and routing
-- ✅ Health monitoring and automatic cleanup
-- ✅ Request/response correlation
-- ✅ Cancellation token management
-- ✅ Concurrent access safety
-- ✅ Configuration flexibility
-- ✅ Backward compatibility
-- ✅ Error handling and edge cases
+#### ✅ **Proven Capabilities**:
+- **State Store Logic**: Session lifecycle management across backends
+- **Cross-Instance Session Discovery**: Finding sessions on other server instances
+- **Health Monitoring**: Automatic detection and cleanup of stale sessions
+- **Request/Response Correlation**: Service-level state tracking
+- **Cancellation Token Management**: Distributed cancellation handling
+- **Concurrent Access Safety**: Thread-safe operations across multiple instances
+- **Configuration Flexibility**: Multiple backend and configuration options
+- **Backward Compatibility**: Existing APIs continue to work
+- **Error Handling**: Graceful degradation and edge case management
+- **Load Balancing Logic**: Round-robin distribution and failover algorithms
+
+#### ⚠️ **Testing Limitations**
+
+Our current test suite has important limitations that should be understood:
+
+**In-Memory Simulation Only**:
+- Load balancer tests use simulated instances in the same process
+- No actual network boundaries or separate server processes
+- No real HTTP/TCP connection testing
+- Redis tests require manual setup with `--features test-redis`
+
+**Missing Network Protocol Validation**:
+- No actual SSE connection testing across network boundaries
+- No real HTTP session routing validation  
+- No WebSocket upgrade testing
+- No sticky session prevention proof with real load balancers
+
+**Missing Production Environment Testing**:
+- No nginx/HAProxy configuration validation
+- No Redis clustering and failover testing
+- No network partition tolerance testing
+- No production latency and performance validation
+
+### Integration Testing Requirements
+
+For **production deployment validation**, additional testing is required:
+
+#### Redis Integration Testing
+```bash
+# Start Redis server
+redis-server
+
+# Run Redis integration tests
+cargo test --test test_redis_integration --features test-redis
+
+# Test Redis clustering (requires Redis cluster setup)
+cargo test test_redis_clustering --features test-redis-cluster
+```
+
+#### Load Balancer Integration Testing
+```bash
+# Example nginx configuration testing
+nginx -t -c nginx-mcp-config.conf
+
+# Real load balancer testing with multiple server instances
+./scripts/test-load-balancer.sh
+```
+
+#### Production Environment Testing
+- **Network Partition Testing**: Simulate Redis unavailability
+- **High Load Testing**: Benchmark under realistic traffic patterns  
+- **Failover Testing**: Validate behavior during Redis master failover
+- **Cross-Region Testing**: Multi-region Redis deployment validation
 
 ## Migration Guide
 
@@ -735,12 +807,46 @@ Performance testing shows:
 
 ## Conclusion
 
-The horizontal scaling architecture provides a robust foundation for deploying MCP applications in cloud environments. The pluggable state store abstraction enables:
+The horizontal scaling architecture provides a **solid foundation** for deploying MCP applications in cloud environments. The pluggable state store abstraction enables:
 
-- **Seamless scaling** from single instance to multiple instances
-- **Load balancer compatibility** without sticky sessions
-- **High availability** through Redis clustering
-- **Health monitoring** and automatic failover
-- **Backward compatibility** with existing applications
+### ✅ **Ready for Production**:
+- **Algorithmic Foundation**: Complete state management and session discovery logic
+- **Backward Compatibility**: Zero-breaking-change integration with existing applications  
+- **Multiple Backends**: Memory for development, Redis for production scaling
+- **Comprehensive APIs**: Full session lifecycle, health monitoring, and failover capabilities
+- **Thread Safety**: Concurrent access patterns thoroughly tested
 
-This implementation positions the Rust MCP SDK as a production-ready solution for enterprise deployments requiring horizontal scalability, high availability, and load balancer integration.
+### ⚠️ **Production Deployment Requirements**:
+
+**Before deploying to production with horizontal scaling:**
+
+1. **Redis Testing**: Set up Redis instance and run integration tests with `--features test-redis`
+2. **Load Balancer Configuration**: Configure nginx/HAProxy to distribute traffic without session affinity
+3. **Network Testing**: Validate SSE connections work across network boundaries
+4. **Performance Testing**: Benchmark Redis latency under expected load
+5. **Failover Testing**: Test Redis master failover scenarios
+6. **Monitoring Setup**: Implement Redis and session health monitoring
+
+### 🎯 **Development vs Production Readiness**:
+
+| Aspect | Development Ready | Production Validated |
+|--------|------------------|---------------------|
+| **State Store Logic** | ✅ Complete | ✅ Tested |
+| **Session Discovery** | ✅ Complete | ✅ Tested |
+| **Health Monitoring** | ✅ Complete | ✅ Tested |
+| **Backward Compatibility** | ✅ Complete | ✅ Tested |
+| **Redis Integration** | ✅ Implemented | ⚠️ Requires Testing |
+| **Load Balancer Integration** | ✅ Simulated | ⚠️ Requires Validation |
+| **Network Protocol Testing** | ❌ Missing | ❌ Requires Implementation |
+| **Production Performance** | ❌ Unknown | ❌ Requires Benchmarking |
+
+### 📋 **Next Steps for Production Deployment**:
+
+1. **Set up Redis infrastructure** with clustering and monitoring
+2. **Configure load balancer** (nginx/HAProxy) without sticky sessions  
+3. **Run Redis integration tests** to validate network communication
+4. **Deploy multiple server instances** and test cross-instance communication
+5. **Implement monitoring** for session distribution and Redis health
+6. **Performance test** under realistic load conditions
+
+This implementation provides **production-capable horizontal scaling infrastructure** with the understanding that additional integration testing and infrastructure setup is required for full production deployment validation.

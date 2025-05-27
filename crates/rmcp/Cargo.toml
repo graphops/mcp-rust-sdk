@@ -124,6 +124,9 @@ schemars = ["dep:schemars"]
 # State store features
 state-store-redis = ["dep:redis", "dep:bincode"]
 
+# Test features
+test-redis = ["state-store-redis"] # Enables Redis integration tests
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 schemars = { version = "0.8" }
@@ -135,6 +138,8 @@ tracing-subscriber = { version = "0.3", features = [
     "fmt",
 ] }
 async-trait = "0.1"
+fastrand = "2.0"
+uuid = { version = "1.0", features = ["v4"] }
 [[test]]
 name = "test_tool_macros"
 required-features = ["server", "client"]
