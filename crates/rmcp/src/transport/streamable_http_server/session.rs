@@ -19,6 +19,7 @@ use crate::{
         JsonRpcNotification, JsonRpcRequest, Notification, ProgressNotificationParam,
         ProgressToken, RequestId, ServerJsonRpcMessage, ServerNotification,
     },
+    state_store::StateStore,
     transport::{
         WorkerTransport,
         worker::{Worker, WorkerContext, WorkerQuitReason, WorkerSendRequest},
@@ -165,11 +166,70 @@ pub struct SessionWorker {
     common: CachedTx,
     event_rx: Receiver<SessionEvent>,
     session_config: SessionConfig,
+    state_store: Option<crate::state_store::MemoryStateStore>,
 }
 
 impl SessionWorker {
     pub fn id(&self) -> &SessionId {
         &self.id
+    }
+
+    /// Register session with state store if available
+    pub async fn register_session_in_state_store(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref state_store) = self.state_store {
+            state_store.create_session(&self.id).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+            let handle_data = crate::state_store::SessionHandleData {
+                created_at: std::time::SystemTime::now(),
+                last_activity: std::time::SystemTime::now(),
+                channel_capacity: self.session_config.channel_capacity,
+            };
+            state_store.register_session_handle(&self.id, &handle_data).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        Ok(())
+    }
+
+    /// Store TX route in state store if available
+    async fn store_tx_route_in_state_store(&self, http_request_id: HttpRequestId, resources: &std::collections::HashSet<ResourceKey>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref state_store) = self.state_store {
+            let route_data = crate::state_store::RouteData {
+                resources: resources.clone(),
+                capacity: self.session_config.channel_capacity,
+                created_at: std::time::SystemTime::now(),
+            };
+            state_store.store_tx_route(&self.id, http_request_id, &route_data).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        Ok(())
+    }
+
+    /// Store resource route in state store if available
+    async fn store_resource_route_in_state_store(&self, resource_key: &ResourceKey, http_request_id: HttpRequestId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref state_store) = self.state_store {
+            state_store.store_resource_route(&self.id, resource_key, http_request_id).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        Ok(())
+    }
+
+    /// Remove TX route from state store if available
+    async fn remove_tx_route_from_state_store(&self, http_request_id: HttpRequestId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref state_store) = self.state_store {
+            state_store.remove_tx_route(&self.id, http_request_id).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        Ok(())
+    }
+
+    /// Remove resource route from state store if available
+    async fn remove_resource_route_from_state_store(&self, resource_key: &ResourceKey) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref state_store) = self.state_store {
+            state_store.remove_resource_route(&self.id, resource_key).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        Ok(())
     }
 }
 
@@ -783,6 +843,35 @@ pub fn create_session(
         common,
         event_rx,
         session_config: config.clone(),
+        state_store: None,
+    };
+    (handle, session_worker)
+}
+
+/// Create a new session with state store support for horizontal scaling.
+pub fn create_session_with_state_store(
+    id: impl Into<SessionId>,
+    config: SessionConfig,
+    state_store: crate::state_store::MemoryStateStore,
+) -> (SessionHandle, SessionWorker) {
+    let id = id.into();
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(config.channel_capacity);
+    let (common_tx, _) = tokio::sync::mpsc::channel(config.channel_capacity);
+    let common = CachedTx::new_common(common_tx);
+    tracing::info!(session_id = ?id, "create new session with state store");
+    let handle = SessionHandle {
+        event_tx,
+        id: id.clone(),
+    };
+    let session_worker = SessionWorker {
+        next_http_request_id: 0,
+        id,
+        tx_router: HashMap::new(),
+        resource_router: HashMap::new(),
+        common,
+        event_rx,
+        session_config: config.clone(),
+        state_store: Some(state_store),
     };
     (handle, session_worker)
 }

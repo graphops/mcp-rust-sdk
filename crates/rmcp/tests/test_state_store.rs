@@ -173,4 +173,74 @@ mod tests {
         let routes = store.list_tx_routes(&session_id).await.unwrap();
         assert_eq!(routes.len(), 0);
     }
+
+    #[cfg(feature = "transport-sse-server")]
+    #[tokio::test]
+    async fn test_sse_server_state_store_integration() {
+        use rmcp::transport::sse_server::{SseServerConfig, SseServer};
+        use std::net::SocketAddr;
+        use tokio_util::sync::CancellationToken;
+        
+        // Create a memory state store
+        let state_store = MemoryStateStore::new();
+        
+        // Create SSE server config with state store
+        let config = SseServerConfig {
+            bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            sse_path: "/sse".to_string(),
+            post_path: "/message".to_string(),
+            ct: CancellationToken::new(),
+            sse_keep_alive: None,
+            state_store: Some(state_store.clone()),
+        };
+        
+        // Create SSE server (just test construction, not actual serving)
+        let (server, _router) = SseServer::new(config);
+        assert_eq!(server.config.sse_path, "/sse");
+        
+        // Verify state store is working
+        let session_id: SessionId = "test-session".into();
+        assert!(!state_store.session_exists(&session_id).await.unwrap());
+        
+        // Test session creation
+        state_store.create_session(&session_id).await.unwrap();
+        assert!(state_store.session_exists(&session_id).await.unwrap());
+        
+        // Test SSE connection registration
+        let connection_data = SseConnectionData {
+            created_at: std::time::SystemTime::now(),
+            last_ping: std::time::SystemTime::now(),
+            ping_interval: std::time::Duration::from_secs(30),
+        };
+        state_store.register_sse_connection(&session_id, &connection_data).await.unwrap();
+        
+        let retrieved = state_store.get_sse_connection(&session_id).await.unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().ping_interval, std::time::Duration::from_secs(30));
+    }
+
+    #[cfg(feature = "transport-streamable-http-server-session")]
+    #[tokio::test]
+    async fn test_session_worker_state_store_integration() {
+        use rmcp::transport::streamable_http_server::session::{create_session_with_state_store, SessionConfig};
+        
+        // Create a memory state store
+        let state_store = MemoryStateStore::new();
+        let session_id: SessionId = "test-session-worker".into();
+        
+        // Create session with state store
+        let config = SessionConfig::default();
+        let (_handle, worker) = create_session_with_state_store(session_id.clone(), config, state_store.clone());
+        
+        // Verify session worker was created correctly
+        assert_eq!(worker.id(), &session_id);
+        
+        // Test state store registration
+        worker.register_session_in_state_store().await.unwrap();
+        assert!(state_store.session_exists(&session_id).await.unwrap());
+        
+        let handle_data = state_store.get_session_handle(&session_id).await.unwrap();
+        assert!(handle_data.is_some());
+        assert_eq!(handle_data.unwrap().channel_capacity, SessionConfig::DEFAULT_CHANNEL_CAPACITY);
+    }
 }

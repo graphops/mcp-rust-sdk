@@ -20,7 +20,7 @@ use crate::{
     model::ClientJsonRpcMessage,
     service::{RxJsonRpcMessage, TxJsonRpcMessage, serve_directly_with_ct},
     transport::common::axum::{DEFAULT_AUTO_PING_INTERVAL, SessionId, session_id},
-    state_store::MemoryStateStore,
+    state_store::{MemoryStateStore, StateStore, SseConnectionData},
 };
 
 type TxStore = Arc<tokio::sync::RwLock<HashMap<SessionId, tokio::sync::mpsc::Sender<ClientJsonRpcMessage>>>>;
@@ -32,6 +32,9 @@ struct App {
     transport_tx: tokio::sync::mpsc::UnboundedSender<SseServerTransport>,
     post_path: Arc<str>,
     sse_ping_interval: Duration,
+    // Optional state store for horizontal scaling
+    state_store: Option<MemoryStateStore>,
+    server_instance_id: String,
 }
 
 impl App {
@@ -49,9 +52,45 @@ impl App {
                 transport_tx,
                 post_path: post_path.into(),
                 sse_ping_interval,
+                state_store: None,
+                server_instance_id: format!("sse-server-{}", uuid::Uuid::new_v4()),
             },
             transport_rx,
         )
+    }
+
+    pub fn with_state_store(mut self, state_store: MemoryStateStore) -> Self {
+        self.state_store = Some(state_store);
+        self
+    }
+
+    async fn register_session(&self, session_id: &SessionId, sender: tokio::sync::mpsc::Sender<ClientJsonRpcMessage>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Always register in local TxStore for backward compatibility
+        self.txs.write().await.insert(session_id.clone(), sender);
+
+        // Also register in state store if available
+        if let Some(ref state_store) = self.state_store {
+            let connection_data = SseConnectionData {
+                created_at: std::time::SystemTime::now(),
+                last_ping: std::time::SystemTime::now(),
+                ping_interval: self.sse_ping_interval,
+            };
+            state_store.register_sse_connection(session_id, &connection_data).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        Ok(())
+    }
+
+    async fn unregister_session(&self, session_id: &SessionId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Remove from local TxStore
+        self.txs.write().await.remove(session_id);
+
+        // Also remove from state store if available
+        if let Some(ref state_store) = self.state_store {
+            state_store.remove_sse_connection(session_id).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        Ok(())
     }
 }
 
@@ -94,10 +133,13 @@ async fn sse_handler(
     let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel(64);
     let to_client_tx_clone = to_client_tx.clone();
 
-    app.txs
-        .write()
-        .await
-        .insert(session.clone(), from_client_tx);
+    // Register session with both local store and optional state store
+    if let Err(e) = app.register_session(&session, from_client_tx).await {
+        tracing::error!(%session, error = %e, "Failed to register session");
+        let mut response = Response::new("Failed to register session".to_string());
+        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        return Err(response);
+    }
     let session = session.clone();
     let stream = ReceiverStream::new(from_client_rx);
     let sink = PollSender::new(to_client_tx);
@@ -129,16 +171,18 @@ async fn sse_handler(
         }
     }));
 
+    let app_clone = app.clone();
     tokio::spawn(async move {
         // Wait for connection closure
         to_client_tx_clone.closed().await;
 
-        // Clean up session
+        // Clean up session from both local store and state store
         let session_id = session.clone();
-        let tx_store = app.txs.clone();
-        let mut txs = tx_store.write().await;
-        txs.remove(&session_id);
-        tracing::debug!(%session_id, "Closed session and cleaned up resources");
+        if let Err(e) = app_clone.unregister_session(&session_id).await {
+            tracing::error!(%session_id, error = %e, "Failed to unregister session");
+        } else {
+            tracing::debug!(%session_id, "Closed session and cleaned up resources");
+        }
     });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(ping_interval)))
@@ -269,10 +313,16 @@ impl SseServer {
     /// Warning: This function creates a new SseServer instance with the provided configuration.
     /// `App.post_path` may be incorrect if using `Router` as an embedded router.
     pub fn new(config: SseServerConfig) -> (SseServer, Router) {
-        let (app, transport_rx) = App::new(
+        let (mut app, transport_rx) = App::new(
             config.post_path.clone(),
             config.sse_keep_alive.unwrap_or(DEFAULT_AUTO_PING_INTERVAL),
         );
+        
+        // Configure state store if provided
+        if let Some(state_store) = config.state_store.clone() {
+            app = app.with_state_store(state_store);
+        }
+        
         let router = Router::new()
             .route(&config.sse_path, get(sse_handler))
             .route(&config.post_path, post(post_event_handler))
