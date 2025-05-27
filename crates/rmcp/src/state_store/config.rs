@@ -143,7 +143,7 @@ mod tests {
         let config = StateStoreConfig::redis_url("redis://localhost:6379");
         matches!(config, StateStoreConfig::Redis(_));
 
-        let config = StateStoreConfig::redis_cluster(vec![
+        let config = StateStoreConfig::redis_multi(vec![
             "redis://node1:6379".to_string(),
             "redis://node2:6379".to_string(),
         ]);

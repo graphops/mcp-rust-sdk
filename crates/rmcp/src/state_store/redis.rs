@@ -73,6 +73,10 @@ impl RedisStateStore {
         format!("{}:sse:{}:connection", self.config.key_prefix, session_id)
     }
 
+    fn sse_connections_key(&self) -> String {
+        format!("{}:sse:connections", self.config.key_prefix)
+    }
+
     fn tx_routes_key(&self, session_id: &SessionId) -> String {
         format!("{}:session:{}:tx_routes", self.config.key_prefix, session_id)
     }
@@ -203,11 +207,19 @@ impl StateStore for RedisStateStore {
 
     async fn register_sse_connection(&self, session_id: &SessionId, connection_data: &SseConnectionData) -> Result<(), Self::Error> {
         let mut conn = self.connection.clone();
-        let key = self.sse_connection_key(session_id);
+        let individual_key = self.sse_connection_key(session_id);
+        let connections_hash_key = self.sse_connections_key();
         let data = self.serialize(connection_data).await?;
         let ttl = self.config.session_ttl.as_secs() as usize;
         
-        let _: () = conn.set_ex(key, data, ttl.try_into().unwrap_or(3600)).await?;
+        // Store individual connection
+        let _: () = conn.set_ex(&individual_key, &data, ttl.try_into().unwrap_or(3600)).await?;
+        
+        // Also store in connections hash for discovery
+        let session_key = self.serialize(session_id).await?;
+        let _: () = conn.hset(&connections_hash_key, session_key, &data).await?;
+        let _: () = conn.expire(&connections_hash_key, ttl as i64).await?;
+        
         Ok(())
     }
 
@@ -223,8 +235,16 @@ impl StateStore for RedisStateStore {
 
     async fn remove_sse_connection(&self, session_id: &SessionId) -> Result<(), Self::Error> {
         let mut conn = self.connection.clone();
-        let key = self.sse_connection_key(session_id);
-        let _: () = conn.del(&key).await?;
+        let individual_key = self.sse_connection_key(session_id);
+        let connections_hash_key = self.sse_connections_key();
+        let session_key = self.serialize(session_id).await?;
+        
+        // Remove individual connection
+        let _: () = conn.del(&individual_key).await?;
+        
+        // Also remove from connections hash
+        let _: () = conn.hdel(&connections_hash_key, session_key).await?;
+        
         Ok(())
     }
 
@@ -481,21 +501,23 @@ impl StateStore for RedisStateStore {
 
     async fn update_session_heartbeat(&self, session_id: &SessionId) -> Result<(), Self::Error> {
         let mut conn = self.connection.clone();
-        let key = self.sse_connections_key();
+        let individual_key = self.sse_connection_key(session_id);
+        let connections_hash_key = self.sse_connections_key();
         let session_key = self.serialize(session_id).await?;
         
         // Get current connection data
-        match conn.hget::<_, _, Vec<u8>>(&key, &session_key).await {
+        match conn.get::<_, Vec<u8>>(&individual_key).await {
             Ok(data) => {
                 let mut connection_data: SseConnectionData = self.deserialize(data).await?;
                 connection_data.last_ping = std::time::SystemTime::now();
                 
-                // Update with new heartbeat
+                // Update both individual key and hash
                 let updated_data = self.serialize(&connection_data).await?;
                 let ttl = self.config.session_ttl.as_secs() as usize;
                 
-                let _: () = conn.hset(&key, session_key, updated_data).await?;
-                let _: () = conn.expire(&key, ttl as i64).await?;
+                let _: () = conn.set_ex(&individual_key, &updated_data, ttl.try_into().unwrap_or(3600)).await?;
+                let _: () = conn.hset(&connections_hash_key, session_key, &updated_data).await?;
+                let _: () = conn.expire(&connections_hash_key, ttl as i64).await?;
             },
             Err(_) => {
                 // Session not found, ignore
@@ -507,10 +529,9 @@ impl StateStore for RedisStateStore {
 
     async fn is_session_healthy(&self, session_id: &SessionId, max_idle_duration: std::time::Duration) -> Result<bool, Self::Error> {
         let mut conn = self.connection.clone();
-        let key = self.sse_connections_key();
-        let session_key = self.serialize(session_id).await?;
+        let key = self.sse_connection_key(session_id);
         
-        match conn.hget::<_, _, Vec<u8>>(&key, session_key).await {
+        match conn.get::<_, Vec<u8>>(&key).await {
             Ok(data) => {
                 let connection_data: SseConnectionData = self.deserialize(data).await?;
                 let now = std::time::SystemTime::now();
@@ -545,9 +566,11 @@ impl StateStore for RedisStateStore {
                 };
                 
                 if is_stale {
-                    // Remove the session
+                    // Remove from both hash and individual key
                     let session_key = self.serialize(&session_id).await?;
-                    let _: () = conn.hdel(&key, session_key).await?;
+                    let individual_key = self.sse_connection_key(&session_id);
+                    let _: () = conn.hdel(&key, &session_key).await?;
+                    let _: () = conn.del(&individual_key).await?;
                     stale_sessions.push(session_id);
                 }
             }
