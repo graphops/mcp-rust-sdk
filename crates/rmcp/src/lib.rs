@@ -112,6 +112,9 @@ pub use service::{RoleClient, serve_client};
 pub use service::{RoleServer, serve_server};
 
 pub mod handler;
+#[cfg(feature = "state-store")]
+#[cfg_attr(docsrs, doc(cfg(feature = "state-store")))]
+pub mod state_store;
 pub mod transport;
 
 // re-export

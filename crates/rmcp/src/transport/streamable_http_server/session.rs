@@ -25,17 +25,17 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServerSessionMessage {
     pub event_id: EventId,
     pub message: Arc<ServerJsonRpcMessage>,
 }
 
 /// `<index>/request_id>`
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct EventId {
-    http_request_id: Option<HttpRequestId>,
-    index: usize,
+    pub http_request_id: Option<HttpRequestId>,
+    pub index: usize,
 }
 
 impl std::fmt::Display for EventId {
@@ -150,9 +150,9 @@ struct HttpRequestWise {
     tx: CachedTx,
 }
 
-type HttpRequestId = u64;
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum ResourceKey {
+pub type HttpRequestId = u64;
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ResourceKey {
     McpRequestId(RequestId),
     ProgressToken(ProgressToken),
 }

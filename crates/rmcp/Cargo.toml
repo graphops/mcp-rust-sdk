@@ -61,6 +61,11 @@ uuid = { version = "1", features = ["v4"], optional = true }
 # macro
 rmcp-macros = { version = "0.1", workspace = true, optional = true }
 
+# state store
+async-trait = { version = "0.1", optional = true }
+redis = { version = "0.24", features = ["aio", "connection-manager", "tokio-comp"], optional = true }
+bincode = { version = "1.3", optional = true }
+
 [features]
 default = ["base64", "macros", "server"]
 client = []
@@ -115,6 +120,10 @@ transport-streamable-http-server-session = [
 tower = ["dep:tower-service"]
 auth = ["dep:oauth2", "__reqwest", "dep:url"]
 schemars = ["dep:schemars"]
+
+# State store features
+state-store = ["dep:async-trait"]
+state-store-redis = ["state-store", "dep:redis", "dep:bincode"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -175,3 +184,8 @@ path = "tests/test_message_protocol.rs"
 name = "test_message_schema"
 required-features = ["server", "client", "schemars"]
 path = "tests/test_message_schema.rs"
+
+[[test]]
+name = "test_state_store"
+required-features = ["state-store"]
+path = "tests/test_state_store.rs"
